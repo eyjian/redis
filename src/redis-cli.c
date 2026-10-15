@@ -269,6 +269,7 @@ static struct config {
     int set_errcode;
     clusterManagerCommand cluster_manager_command;
     int no_auth_warning;
+    int enable_write; /* Allow write commands (default: read-only mode). */
     int resp2; /* value of 1: specified explicitly with option -2 */
     int resp3; /* value of 1: specified explicitly, value of 2: implicit like --json option */
     int current_resp3; /* 1 if we have RESP3 right now in the current connection. */
@@ -2769,6 +2770,8 @@ static int parseOptions(int argc, char **argv) {
             config.output = OUTPUT_STANDARD;
         } else if (!strcmp(argv[i],"--quoted-input")) {
             config.quoted_input = 1;
+        } else if (!strcmp(argv[i],"--enable-write")) {
+            config.enable_write = 1;
         } else if (!strcmp(argv[i],"--csv")) {
             config.output = OUTPUT_CSV;
         } else if (!strcmp(argv[i],"--json")) {
@@ -3327,6 +3330,10 @@ version,tls_usage);
 "  --verbose          Verbose mode.\n"
 "  --no-auth-warning  Don't show warning message when using password on command\n"
 "                     line interface.\n"
+"  --enable-write     Allow write commands. By default redis-cli runs in\n"
+"                     read-only mode, where only known read commands are\n"
+"                     allowed (in interactive mode ':set write' can be\n"
+"                     used as well).\n"
 "  --help             Output this help and exit.\n"
 "  --version          Output version and exit.\n"
 "\n");
@@ -3372,6 +3379,140 @@ static int confirmWithYes(char *msg, int ignore_force) {
     return (nread != 0 && !strcmp("yes", buf));
 }
 
+/*------------------------------------------------------------------------------
+ * Read-only mode (default)
+ *
+ * By default redis-cli only allows read commands, using a whitelist: a
+ * command is only allowed when it is explicitly known to be read-only.
+ * Everything else (write commands, commands not present in the built-in
+ * command table such as module-provided commands, or unclassified
+ * commands) is rejected (fail-safe). Write commands can be enabled with
+ * the --enable-write command line option or, interactively, with
+ * ':set write'.
+ *--------------------------------------------------------------------------- */
+
+/* Top-level commands that don't carry the CMD_READONLY flag but are known
+ * to be safe in read-only mode (connection / session / replication /
+ * observation commands). */
+static const char *cliSafeCommands[] = {
+    "asking", "auth", "command", "dbsize", "echo", "hello", "info",
+    "lastsave", "lolwut", "monitor", "ping", "psync",
+    "psubscribe", "punsubscribe", "quit", "randomkey", "readonly",
+    "readwrite", "replconf", "reset", "select", "ssubscribe",
+    "sunsubscribe", "subscribe", "sync", "time", "unsubscribe",
+    "wait", "waitaof",
+};
+
+/* Container (parent, subcommand) pairs that don't carry the CMD_READONLY
+ * flag but are known to be safe in read-only mode. */
+static const char *cliSafeSubcommands[][2] = {
+    {"acl", "cat"}, {"acl", "dryrun"}, {"acl", "genpass"}, {"acl", "getuser"},
+    {"acl", "help"}, {"acl", "list"}, {"acl", "log"}, {"acl", "users"},
+    {"acl", "whoami"},
+    {"backup", "help"}, {"backup", "list"}, {"backup", "status"},
+    {"bless", "get"}, {"bless", "scan"},
+    {"client", "caching"}, {"client", "getname"}, {"client", "getredir"},
+    {"client", "help"}, {"client", "id"}, {"client", "info"},
+    {"client", "list"}, {"client", "no-touch"}, {"client", "reply"},
+    {"client", "setinfo"}, {"client", "setname"}, {"client", "tracking"},
+    {"client", "trackinginfo"},
+    {"cluster", "count-failure-reports"}, {"cluster", "countkeysinslot"},
+    {"cluster", "getkeysinslot"}, {"cluster", "help"}, {"cluster", "info"},
+    {"cluster", "keyslot"}, {"cluster", "links"}, {"cluster", "migration"},
+    {"cluster", "myid"}, {"cluster", "myshardid"}, {"cluster", "nodes"},
+    {"cluster", "replicas"}, {"cluster", "shards"}, {"cluster", "slaves"},
+    {"cluster", "slot-stats"}, {"cluster", "slots"},
+    {"command", "count"}, {"command", "docs"}, {"command", "getkeys"},
+    {"command", "getkeysandflags"}, {"command", "help"},
+    {"command", "info"}, {"command", "list"},
+    {"config", "get"}, {"config", "help"},
+    {"function", "dump"}, {"function", "help"}, {"function", "list"},
+    {"function", "stats"},
+    {"hotkeys", "get"}, {"hotkeys", "help"},
+    {"latency", "doctor"}, {"latency", "graph"}, {"latency", "help"},
+    {"latency", "histogram"}, {"latency", "history"}, {"latency", "latest"},
+    {"memory", "doctor"}, {"memory", "help"}, {"memory", "malloc-stats"},
+    {"memory", "stats"},
+    {"module", "help"}, {"module", "list"},
+    {"object", "help"},
+    {"pubsub", "channels"}, {"pubsub", "help"}, {"pubsub", "numpat"},
+    {"pubsub", "numsub"}, {"pubsub", "shardchannels"},
+    {"pubsub", "shardnumsub"},
+    {"script", "exists"}, {"script", "help"}, {"script", "load"},
+    {"sentinel", "ckquorum"}, {"sentinel", "get-master-addr-by-name"},
+    {"sentinel", "help"}, {"sentinel", "info-cache"},
+    {"sentinel", "is-master-down-by-addr"}, {"sentinel", "master"},
+    {"sentinel", "masters"}, {"sentinel", "myid"},
+    {"sentinel", "pending-scripts"}, {"sentinel", "replicas"},
+    {"sentinel", "sentinels"}, {"sentinel", "slaves"},
+    {"slowlog", "get"}, {"slowlog", "help"}, {"slowlog", "len"},
+    {"xgroup", "help"},
+    {"xinfo", "help"},
+};
+
+/* Look up the commandDocs entry matching argv[0], resolving subcommands
+ * (argv[1]) for container commands. Returns NULL if the command is not
+ * present in the built-in command table. */
+static struct commandDocs *cliFindCommandDocs(int argc, char **argv) {
+    struct commandDocs *cmd = NULL;
+    size_t i;
+
+    for (i = 0; redisCommandTable[i].name != NULL; i++) {
+        if (!strcasecmp(redisCommandTable[i].name, argv[0])) {
+            cmd = &redisCommandTable[i];
+            break;
+        }
+    }
+    if (cmd == NULL) return NULL;
+
+    if (argc > 1 && cmd->subcommands) {
+        for (i = 0; cmd->subcommands[i].name != NULL; i++) {
+            if (!strcasecmp(cmd->subcommands[i].name, argv[1]))
+                return &cmd->subcommands[i];
+        }
+    }
+    return cmd;
+}
+
+/* Returns 1 if the command (argc/argv) is allowed to execute while redis-cli
+ * is in read-only mode (the default), or 0 otherwise. Read-only mode uses a
+ * whitelist: only commands explicitly known to be read-only are allowed.
+ * Commands not found in the built-in command table (e.g. commands registered
+ * by modules) are rejected as well (fail-safe). */
+static int cliIsCommandAllowedInReadOnly(int argc, char **argv) {
+    struct commandDocs *cmd = cliFindCommandDocs(argc, argv);
+    size_t i;
+
+    if (cmd == NULL) return 0; /* Unknown command: fail-safe. */
+
+    /* Commands marked read-only in the built-in command table. */
+    if (cmd->flags & CMD_READONLY) return 1;
+
+    /* Known safe commands without the readonly flag. */
+    for (i = 0; i < sizeof(cliSafeCommands)/sizeof(cliSafeCommands[0]); i++)
+        if (!strcasecmp(argv[0], cliSafeCommands[i])) return 1;
+    if (argc >= 2) {
+        for (i = 0; i < sizeof(cliSafeSubcommands)/sizeof(cliSafeSubcommands[0]); i++)
+            if (!strcasecmp(argv[0], cliSafeSubcommands[i][0]) &&
+                !strcasecmp(argv[1], cliSafeSubcommands[i][1])) return 1;
+    }
+    return 0;
+}
+
+/* Reject commands that are not on the read-only whitelist when running in
+ * read-only mode (the default). Returns REDIS_OK if the command is allowed,
+ * REDIS_ERR otherwise (with an error message already printed). */
+static int cliCheckWritePermission(int argc, char **argv) {
+    if (config.enable_write || cliIsCommandAllowedInReadOnly(argc, argv))
+        return REDIS_OK;
+    printf("(error) ERR The command '%s' is not allowed in read-only mode "
+           "(only known read commands are allowed by default). "
+           "Use --enable-write (or ':set write' in interactive mode) to "
+           "allow it.\n",
+           argv[0]);
+    return REDIS_ERR;
+}
+
 static int issueCommandRepeat(int argc, char **argv, long repeat) {
     /* In Lua debugging mode, we want to pass the "help" to Redis to get
      * it's own HELP message, rather than handle it by the CLI, see ldbRepl.
@@ -3383,6 +3524,10 @@ static int issueCommandRepeat(int argc, char **argv, long repeat) {
         cliOutputHelp(--argc, ++argv);
         return REDIS_OK;
     }
+
+    /* In read-only mode (the default), reject write commands before they
+     * are sent to the server. */
+    if (cliCheckWritePermission(argc, argv) != REDIS_OK) return REDIS_ERR;
 
     while (1) {
         if (config.cluster_reissue_command || context == NULL ||
@@ -3459,6 +3604,8 @@ void cliSetPreferences(char **argv, int argc, int interactive) {
     if (!strcasecmp(argv[0],":set") && argc >= 2) {
         if (!strcasecmp(argv[1],"hints")) pref.hints = 1;
         else if (!strcasecmp(argv[1],"nohints")) pref.hints = 0;
+        else if (!strcasecmp(argv[1],"write")) config.enable_write = 1;
+        else if (!strcasecmp(argv[1],"nowrite")) config.enable_write = 0;
         else {
             printf("%sunknown redis-cli preference '%s'\n",
                 interactive ? "" : ".redisclirc: ",
@@ -11361,6 +11508,7 @@ int main(int argc, char **argv) {
     config.rdb_filename = NULL;
     config.pipe_mode = 0;
     config.pipe_timeout = REDIS_CLI_DEFAULT_PIPE_TIMEOUT;
+    config.enable_write = 0;
     config.bigkeys = 0;
     config.memkeys = 0;
     config.keystats = 0;
@@ -11447,6 +11595,23 @@ int main(int argc, char **argv) {
 
     /* Cluster Manager mode */
     if (CLUSTER_MANAGER_MODE()) {
+        /* Mutating cluster manager commands are write commands: require
+         * --enable-write when running in read-only mode (the default). */
+        if (!config.enable_write) {
+            static const char *write_cmds[] = {
+                "add-node", "backup", "call", "create", "del-node", "fix",
+                "import", "rebalance", "reshard", "set-timeout", NULL};
+            const char *name = config.cluster_manager_command.name;
+            for (int i = 0; write_cmds[i] != NULL; i++) {
+                if (!strcasecmp(name, write_cmds[i])) {
+                    fprintf(stderr,
+                        "'--cluster %s' modifies the cluster and is not "
+                        "allowed in read-only mode. Use --enable-write to "
+                        "allow write commands.\n", name);
+                    exit(1);
+                }
+            }
+        }
         clusterManagerCommandProc *proc = validateClusterManagerCommand();
         if (!proc) {
             exit(1);
@@ -11468,6 +11633,12 @@ int main(int argc, char **argv) {
 
     /* Latency mode */
     if (config.vset_recall_mode) {
+        if (!config.enable_write) {
+            fprintf(stderr,
+                "--vset-recall creates random vectors and is not allowed in "
+                "read-only mode. Use --enable-write to allow write commands.\n");
+            exit(1);
+        }
         if (cliConnect(0) == REDIS_ERR) exit(1);
         vsetRecallMode();
     }
@@ -11494,6 +11665,13 @@ int main(int argc, char **argv) {
 
     /* Pipe mode */
     if (config.pipe_mode) {
+        if (!config.enable_write) {
+            fprintf(stderr,
+                "--pipe sends raw protocol and can't be filtered; it is not "
+                "allowed in read-only mode. Use --enable-write to allow "
+                "write commands.\n");
+            exit(1);
+        }
         if (cliConnect(0) == REDIS_ERR) exit(1);
         pipeMode();
     }
@@ -11537,6 +11715,12 @@ int main(int argc, char **argv) {
 
     /* LRU test mode */
     if (config.lru_test_mode) {
+        if (!config.enable_write) {
+            fprintf(stderr,
+                "--lru-test performs writes and is not allowed in read-only "
+                "mode. Use --enable-write to allow write commands.\n");
+            exit(1);
+        }
         if (cliConnect(0) == REDIS_ERR) exit(1);
         LRUTestMode();
     }
